@@ -24,6 +24,9 @@ const SKIPPED_FILES = [
     // Passes JS flags.
     'd8-arguments.js',
 
+    // Basically an infinite loop without quit().
+    'd8-finalization-registry-quit',
+
     // Slow tests or tests that are too large to be used as input.
     /numops-fuzz-part.*.js/,
     'regexp-pcre.js',
@@ -54,6 +57,9 @@ const SKIPPED_FILES = [
 
     // Empty test that just sets flags.
     'regress-392928803.js',
+
+    // Tests for differential-fuzzing internals are not useful to re-fuzz.
+    /foozzie.*\.js/,
 ];
 
 const SKIPPED_DIRECTORIES = [

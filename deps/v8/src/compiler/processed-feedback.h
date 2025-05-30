@@ -111,12 +111,10 @@ class KeyedAccessMode {
 
  private:
   AccessMode const access_mode_;
-  union LoadStoreMode {
-    LoadStoreMode(KeyedAccessLoadMode load_mode);
-    LoadStoreMode(KeyedAccessStoreMode store_mode);
-    KeyedAccessLoadMode load_mode;
-    KeyedAccessStoreMode store_mode;
-  } const load_store_mode_;
+  union {
+    KeyedAccessLoadMode load_mode_;    // If IsLoad().
+    KeyedAccessStoreMode store_mode_;  // If IsStore().
+  };
 
   KeyedAccessMode(AccessMode access_mode, KeyedAccessLoadMode load_mode);
   KeyedAccessMode(AccessMode access_mode, KeyedAccessStoreMode store_mode);
@@ -224,6 +222,8 @@ class SingleValueFeedback : public ProcessedFeedback {
       : ProcessedFeedback(K, slot_kind), value_(value) {
     DCHECK(
         (K == kBinaryOperation && slot_kind == FeedbackSlotKind::kBinaryOp) ||
+        (K == kBinaryOperation &&
+         slot_kind == FeedbackSlotKind::kStringAddAndInternalize) ||
         (K == kTypeOf && slot_kind == FeedbackSlotKind::kTypeOf) ||
         (K == kCompareOperation && slot_kind == FeedbackSlotKind::kCompareOp) ||
         (K == kForIn && slot_kind == FeedbackSlotKind::kForIn) ||

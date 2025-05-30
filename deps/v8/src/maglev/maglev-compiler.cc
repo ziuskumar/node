@@ -190,12 +190,19 @@ bool MaglevCompiler::Compile(LocalIsolate* local_isolate,
 
   {
     // Post-hoc optimisation:
+    //   - Remove unreachable blocks
     //   - Dead node marking
     //   - Cleaning up identity nodes
     TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
                  "V8.Maglev.DeadCodeMarking");
-    GraphMultiProcessor<AnyUseMarkingProcessor> processor;
-    processor.ProcessGraph(graph);
+    if (graph->may_have_unreachable_blocks()) {
+      GraphMultiProcessor<SweepUnreachableBasicBlocks, AnyUseMarkingProcessor>
+          processor;
+      processor.ProcessGraph(graph);
+    } else {
+      GraphProcessor<AnyUseMarkingProcessor> processor;
+      processor.ProcessGraph(graph);
+    }
   }
 
   if (is_tracing_enabled && v8_flags.print_maglev_graphs) {
@@ -292,7 +299,7 @@ std::pair<MaybeHandle<Code>, BailoutReason> MaglevCompiler::GenerateCode(
           ->shared_function_info()
           .object()
           ->set_maglev_compilation_failed(true);
-      return {{}, BailoutReason::kCodeGenerationFailed};
+      return {{}, BailoutReason::kMaglevCodeGenerationFailed};
     }
   }
 

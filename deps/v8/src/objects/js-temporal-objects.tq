@@ -4,9 +4,6 @@
 
 #include 'src/objects/js-temporal-objects.h'
 
-bitfield struct JSTemporalCalendarFlags extends uint31 {
-  calendar_index: int32: 5 bit;
-}
 
 bitfield struct JSTemporalYearMonthDay extends uint31 {
   iso_year: int32: 20 bit;
@@ -34,25 +31,12 @@ bitfield struct JSTemporalTimeZoneSubMilliseconds extends uint31 {
   offset_sub_milliseconds: int32: 21 bit;
 }
 
-extern class JSTemporalCalendar extends JSObject {
-  flags: SmiTagged<JSTemporalCalendarFlags>;
-}
-
 extern class JSTemporalDuration extends JSObject {
-  years: Number;
-  months: Number;
-  weeks: Number;
-  days: Number;
-  hours: Number;
-  minutes: Number;
-  seconds: Number;
-  milliseconds: Number;
-  microseconds: Number;
-  nanoseconds: Number;
+  duration: Foreign;  // Managed<temporal_rs::Duration>
 }
 
 extern class JSTemporalInstant extends JSObject {
-  nanoseconds: BigInt;
+  instant: Foreign;  // Managed<temporal_rs::Instant>
 }
 
 extern class JSTemporalPlainDateTime extends JSObject {

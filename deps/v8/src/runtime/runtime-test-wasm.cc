@@ -165,7 +165,7 @@ RUNTIME_FUNCTION(Runtime_CountUnoptimizedWasmToJSWrapper) {
   Tagged<WasmTrustedInstanceData> trusted_data =
       instance_object->trusted_data(isolate);
   Address wrapper_entry =
-      Builtins::EntryOf(Builtin::kWasmToJsWrapperAsm, isolate);
+      Builtins::EmbeddedEntryOf(Builtin::kWasmToJsWrapperAsm);
 
   int result = 0;
   Tagged<WasmDispatchTable> dispatch_table =
@@ -201,12 +201,13 @@ RUNTIME_FUNCTION(Runtime_HasUnoptimizedWasmToJSWrapper) {
   }
   Tagged<JSFunction> function = Cast<JSFunction>(args[0]);
   Tagged<SharedFunctionInfo> sfi = function->shared();
-  if (!sfi->HasWasmFunctionData()) return isolate->heap()->ToBoolean(false);
+  if (!sfi->HasWasmFunctionData(isolate))
+    return isolate->heap()->ToBoolean(false);
   Tagged<WasmFunctionData> func_data = sfi->wasm_function_data();
   WasmCodePointer call_target = func_data->internal()->call_target();
 
   Address wrapper_entry =
-      Builtins::EntryOf(Builtin::kWasmToJsWrapperAsm, isolate);
+      Builtins::EmbeddedEntryOf(Builtin::kWasmToJsWrapperAsm);
   return isolate->heap()->ToBoolean(
       wasm::GetProcessWideWasmCodePointerTable()->EntrypointEqualTo(
           call_target, wrapper_entry));
@@ -518,7 +519,8 @@ RUNTIME_FUNCTION(Runtime_DeserializeWasmModule) {
   CHECK(!buffer->was_detached());
   CHECK(!wire_bytes->WasDetached());
 
-  DirectHandle<JSArrayBuffer> wire_bytes_buffer = wire_bytes->GetBuffer();
+  DirectHandle<JSArrayBuffer> wire_bytes_buffer =
+      wire_bytes->GetBuffer(isolate);
   base::Vector<const uint8_t> wire_bytes_vec{
       reinterpret_cast<const uint8_t*>(wire_bytes_buffer->backing_store()) +
           wire_bytes->byte_offset(),
@@ -982,8 +984,8 @@ RUNTIME_FUNCTION(Runtime_SetWasmImportedStringsEnabled) {
 }
 
 RUNTIME_FUNCTION(Runtime_FlushLiftoffCode) {
-  auto [code_size, metadata_size] = wasm::GetWasmEngine()->FlushLiftoffCode();
-  return Smi::FromInt(static_cast<int>(code_size + metadata_size));
+  wasm::GetWasmEngine()->FlushLiftoffCode();
+  return ReadOnlyRoots(isolate).undefined_value();
 }
 
 RUNTIME_FUNCTION(Runtime_WasmTriggerCodeGC) {

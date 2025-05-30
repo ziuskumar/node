@@ -144,6 +144,18 @@ struct BuiltinCallDescriptor {
   GENERIC_UNOP_LIST(DECL_GENERIC_UNOP)
 #undef DECL_GENERIC_UNOP
 
+  struct DetachContextCell : public Descriptor<DetachContextCell> {
+    static constexpr auto kFunction = Builtin::kDetachContextCell;
+    using arguments_t = std::tuple<V<Context>, V<Object>, V<WordPtr>>;
+    using results_t = std::tuple<V<Object>>;
+
+    static constexpr bool kNeedsFrameState = true;
+    static constexpr bool kNeedsContext = false;
+    static constexpr Operator::Properties kProperties = Operator::kNoProperties;
+    static constexpr OpEffects kEffects =
+        base_effects.CanWriteHeapMemory().CanReadMemory();
+  };
+
   struct ToNumber : public Descriptor<ToNumber> {
     static constexpr auto kFunction = Builtin::kToNumber;
     using arguments_t = std::tuple<V<Object>>;
@@ -665,6 +677,19 @@ struct BuiltinCallDescriptor {
 
   struct WasmInt32ToHeapNumber : public Descriptor<WasmInt32ToHeapNumber> {
     static constexpr auto kFunction = Builtin::kWasmInt32ToHeapNumber;
+    using arguments_t = std::tuple<V<Word32>>;
+    using results_t = std::tuple<V<HeapNumber>>;
+
+    static constexpr bool kNeedsFrameState = false;
+    static constexpr bool kNeedsContext = false;
+    static constexpr Operator::Properties kProperties = Operator::kPure;
+    static constexpr OpEffects kEffects =
+        base_effects.CanAllocateWithoutIdentity();
+  };
+
+  struct WasmInt32ToSharedHeapNumber
+      : public Descriptor<WasmInt32ToSharedHeapNumber> {
+    static constexpr auto kFunction = Builtin::kWasmInt32ToSharedHeapNumber;
     using arguments_t = std::tuple<V<Word32>>;
     using results_t = std::tuple<V<HeapNumber>>;
 

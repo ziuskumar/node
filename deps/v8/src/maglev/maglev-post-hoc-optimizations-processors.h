@@ -5,6 +5,7 @@
 #ifndef V8_MAGLEV_MAGLEV_POST_HOC_OPTIMIZATIONS_PROCESSORS_H_
 #define V8_MAGLEV_MAGLEV_POST_HOC_OPTIMIZATIONS_PROCESSORS_H_
 
+#include "absl/container/flat_hash_set.h"
 #include "src/compiler/heap-refs.h"
 #include "src/maglev/maglev-compilation-info.h"
 #include "src/maglev/maglev-graph-builder.h"
@@ -32,6 +33,14 @@ class SweepIdentityNodes {
       while (input.node() && input.node()->Is<Identity>()) {
         node->change_input(i, input.node()->input(0).node());
       }
+    }
+    // While visiting the deopt info, the iterator will clear the identity nodes
+    // automatically.
+    if (node->properties().can_lazy_deopt()) {
+      node->lazy_deopt_info()->ForEachInput([&](ValueNode* node) {});
+    }
+    if (node->properties().can_eager_deopt()) {
+      node->eager_deopt_info()->ForEachInput([&](ValueNode* node) {});
     }
     return ProcessResult::kContinue;
   }
@@ -94,7 +103,7 @@ class LoopOptimizationProcessor {
     return input->owner() != current_block;
   }
 
-  ProcessResult Process(LoadTaggedFieldForContextSlot* ltf,
+  ProcessResult Process(LoadTaggedFieldForContextSlotNoCells* ltf,
                         const ProcessingState& state) {
     DCHECK(loop_effects);
     ValueNode* object = ltf->object_input().node();
@@ -190,6 +199,81 @@ template <typename NodeT>
 constexpr bool CanBeStoreToNonEscapedObject() {
   return CanBeStoreToNonEscapedObject(NodeBase::opcode_of<NodeT>);
 }
+
+class SweepUnreachableBasicBlocks {
+ public:
+  void PreProcessGraph(Graph* graph) {
+    DCHECK(graph->may_have_unreachable_blocks());
+  }
+
+  template <typename NodeT>
+  ProcessResult Process(NodeT* node, const ProcessingState& state) {
+    return ProcessResult::kContinue;
+  }
+
+  void MarkDead(BasicBlock* block) {
+    block->mark_dead();
+    block->ForEachSuccessor([&](BasicBlock* succ) {
+      if (succ->is_dead()) {
+        return;
+      }
+      auto IsDead = [&](BasicBlock* pred) { return pred->is_dead(); };
+      if (succ->ForAllPredecessors(IsDead)) {
+        MarkDead(succ);
+      } else {
+        DCHECK(succ->has_state());
+        if (succ->is_loop() && succ->backedge_predecessor() == block) {
+          succ->state()->TurnLoopIntoRegularBlock();
+        } else {
+          succ->state()->RemovePredecessorAt(block->predecessor_id());
+        }
+      }
+    });
+  }
+
+  BlockProcessResult PreProcessBasicBlock(BasicBlock* block) {
+    if (block->has_state() && block->state()->IsUnreachable()) {
+      MarkDead(block);
+      found_dead_ = true;
+      return BlockProcessResult::kSkip;
+    }
+    if (block->is_exception_handler_block()) {
+      if (!reachable_catch_blocks_.count(block->id())) {
+        maybe_dead_catch_blocks_.push_back(block);
+      }
+    }
+    for (auto handler : block->exception_handlers()) {
+      if (!handler->HasExceptionHandler()) continue;
+      if (handler->ShouldLazyDeopt()) continue;
+      BasicBlock* catch_block = handler->catch_block();
+      reachable_catch_blocks_.insert(catch_block->id());
+    }
+    return BlockProcessResult::kContinue;
+  }
+  BlockProcessResult PostProcessBasicBlock(BasicBlock* block) {
+    return BlockProcessResult::kContinue;
+  }
+  void PostPhiProcessing() {}
+
+  void PostProcessGraph(Graph* graph) {
+    for (BasicBlock* cur : maybe_dead_catch_blocks_) {
+      if (!reachable_catch_blocks_.count(cur->id())) {
+        MarkDead(cur);
+        found_dead_ = true;
+      }
+    }
+    if (found_dead_) {
+      graph->IterateGraphAndSweepDeadBlocks(
+          [&](BasicBlock* block) { return block->is_dead(); });
+    }
+    graph->set_may_have_unreachable_blocks(false);
+  }
+
+ private:
+  bool found_dead_ = false;
+  absl::flat_hash_set<BasicBlock::Id> reachable_catch_blocks_;
+  std::vector<BasicBlock*> maybe_dead_catch_blocks_;
+};
 
 class AnyUseMarkingProcessor {
  public:

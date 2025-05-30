@@ -18,10 +18,6 @@
 #include "src/objects/oddball.h"
 #include "src/runtime/runtime.h"
 
-#if DEBUG && V8_ENABLE_WEBASSEMBLY
-#include "src/wasm/canonical-types.h"
-#endif
-
 namespace v8 {
 namespace internal {
 
@@ -293,9 +289,9 @@ class CallParameters final {
                               feedback_hash(p.feedback_));
   }
 
-  using ArityField = base::BitField<size_t, 0, 27>;
-  using CallFeedbackRelationField = base::BitField<CallFeedbackRelation, 27, 2>;
-  using SpeculationModeField = base::BitField<SpeculationMode, 29, 1>;
+  using ArityField = base::BitField<size_t, 0, 26>;
+  using CallFeedbackRelationField = base::BitField<CallFeedbackRelation, 26, 2>;
+  using SpeculationModeField = base::BitField<SpeculationMode, 28, 2>;
   using ConvertReceiverModeField = base::BitField<ConvertReceiverMode, 30, 2>;
 
   uint32_t const bit_field_;
@@ -568,15 +564,18 @@ CreateArgumentsType const& CreateArgumentsTypeOf(const Operator* op);
 // used as parameter by JSCreateArray operators.
 class CreateArrayParameters final {
  public:
-  CreateArrayParameters(size_t arity, OptionalAllocationSiteRef site)
-      : arity_(arity), site_(site) {}
+  CreateArrayParameters(size_t arity, OptionalAllocationSiteRef site,
+                        const FeedbackSource& feedback)
+      : arity_(arity), site_(site), feedback_(feedback) {}
 
   size_t arity() const { return arity_; }
   OptionalAllocationSiteRef site() const { return site_; }
+  const FeedbackSource& call_feedback() const { return feedback_; }
 
  private:
   size_t const arity_;
   OptionalAllocationSiteRef const site_;
+  FeedbackSource const feedback_;
 
   friend bool operator==(CreateArrayParameters const&,
                          CreateArrayParameters const&);
@@ -850,16 +849,7 @@ class JSWasmCallParameters {
                                 int function_index,
                                 SharedFunctionInfoRef shared_fct_info,
                                 wasm::NativeModule* native_module,
-                                FeedbackSource const& feedback)
-      : module_(module),
-        signature_(signature),
-        function_index_(function_index),
-        shared_fct_info_(shared_fct_info),
-        native_module_(native_module),
-        feedback_(feedback) {
-    DCHECK_NOT_NULL(module);
-    DCHECK(wasm::GetTypeCanonicalizer()->Contains(signature));
-  }
+                                FeedbackSource const& feedback);
 
   const wasm::WasmModule* module() const { return module_; }
   const wasm::CanonicalSig* signature() const { return signature_; }
@@ -948,7 +938,8 @@ class V8_EXPORT_PRIVATE JSOperatorBuilder final
 
   const Operator* Create();
   const Operator* CreateArguments(CreateArgumentsType type);
-  const Operator* CreateArray(size_t arity, OptionalAllocationSiteRef site);
+  const Operator* CreateArray(size_t arity, OptionalAllocationSiteRef site,
+                              const FeedbackSource& feedback);
   const Operator* CreateArrayIterator(IterationKind);
   const Operator* CreateAsyncFunctionObject(int register_count);
   const Operator* CreateCollectionIterator(CollectionKind, IterationKind);
@@ -1082,6 +1073,8 @@ class V8_EXPORT_PRIVATE JSOperatorBuilder final
   const Operator* AsyncFunctionEnter();
   const Operator* AsyncFunctionReject();
   const Operator* AsyncFunctionResolve();
+
+  const Operator* DetachContextCell(int index);
 
   const Operator* ForInEnumerate();
   const Operator* ForInNext(ForInMode mode, const FeedbackSource& feedback);

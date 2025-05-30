@@ -175,7 +175,7 @@ OpIndex WasmGraphBuilderBase::CallRuntime(
 }
 
 OpIndex WasmGraphBuilderBase::GetBuiltinPointerTarget(Builtin builtin) {
-  static_assert(std::is_same<Smi, BuiltinPtr>(), "BuiltinPtr must be Smi");
+  static_assert(std::is_same_v<Smi, BuiltinPtr>, "BuiltinPtr must be Smi");
   return __ SmiConstant(Smi::FromInt(static_cast<int>(builtin)));
 }
 
@@ -2258,8 +2258,7 @@ class TurboshaftGraphBuildingInterface : public WasmGraphBuilderBase {
 #if DEBUG
     // Reset the context again after the call, to make sure nobody is using the
     // leftover context in the isolate.
-    __ Store(__ LoadRootRegister(),
-             __ WordPtrConstant(Context::kInvalidContext),
+    __ Store(__ LoadRootRegister(), __ WordPtrConstant(Context::kNoContext),
              StoreOp::Kind::RawAligned(), MemoryRepresentation::UintPtr(),
              compiler::kNoWriteBarrier, Isolate::context_offset());
 #endif
@@ -4321,20 +4320,125 @@ class TurboshaftGraphBuildingInterface : public WasmGraphBuilderBase {
     __ TrapIfNot(result, TrapId::kTrapMemOutOfBounds);
   }
 
+  void InlineMemCopy(const WasmMemory* dst_memory, const WasmMemory* src_memory,
+                     V<WordPtr> dst_offset, V<WordPtr> src_offset,
+                     V<WordPtr> size_op, int32_t bytes_to_copy) {
+    if (dst_memory->index == src_memory->index) {
+      // Bounds check the read and write from the same memory.
+      V<WordPtr> mem_size = MemSize(src_memory->index);
+      V<WordPtr> offset_limit = __ WordPtrSub(mem_size, size_op);
+      __ TrapIfNot(__ Word32BitwiseAnd(
+                       __ Word32BitwiseAnd(
+                           __ UintPtrLessThanOrEqual(src_offset, offset_limit),
+                           __ UintPtrLessThanOrEqual(dst_offset, offset_limit)),
+                       __ UintPtrLessThanOrEqual(size_op, mem_size)),
+                   TrapId::kTrapMemOutOfBounds);
+    } else {
+      // Insert bounds checks for src and dst memories.
+      auto BoundsCheck = [this](const WasmMemory* memory, V<WordPtr> offset,
+                                V<WordPtr> size_op) {
+        V<WordPtr> mem_size = MemSize(memory->index);
+        V<WordPtr> offset_limit = __ WordPtrSub(mem_size, size_op);
+        __ TrapIfNot(__ Word32BitwiseAnd(
+                         __ UintPtrLessThanOrEqual(size_op, mem_size),
+                         __ UintPtrLessThanOrEqual(offset, offset_limit)),
+                     TrapId::kTrapMemOutOfBounds);
+      };
+      BoundsCheck(src_memory, src_offset, size_op);
+      BoundsCheck(dst_memory, dst_offset, size_op);
+    }
+
+    // We've performed the bounds check above.
+    constexpr auto strategy = compiler::BoundsCheckResult::kDynamicallyChecked;
+
+    // Calculate the effective addresses of src and dst.
+    V<WordPtr> src_mem_start = MemStart(src_memory->index);
+    V<WordPtr> dst_mem_start = MemStart(dst_memory->index);
+    V<WordPtr> src_base = __ WordPtrAdd(src_mem_start, src_offset);
+    V<WordPtr> dst_base = __ WordPtrAdd(dst_mem_start, dst_offset);
+
+    // Try to use the largest types first for the transfer.
+    constexpr std::array memory_reps = {
+        MemoryRepresentation::Simd128(), MemoryRepresentation::Uint64(),
+        MemoryRepresentation::Uint32(),  MemoryRepresentation::Uint16(),
+        MemoryRepresentation::Uint8(),
+    };
+
+    // Load all of the data into registers.
+    base::SmallVector<OpIndex, 16> loads;
+    int32_t load_bytes_remaining = bytes_to_copy;
+    int32_t load_offset = 0;
+    for (MemoryRepresentation mem_rep : memory_reps) {
+      RegisterRepresentation result_rep = mem_rep.ToRegisterRepresentation();
+      LoadOp::Kind load_kind = GetMemoryAccessKind(mem_rep, strategy);
+      DCHECK_EQ(load_kind, LoadOp::Kind::RawAligned().NotLoadEliminable());
+      uint8_t bytes_per_load = mem_rep.SizeInBytes();
+      unsigned num_loads = load_bytes_remaining / mem_rep.SizeInBytes();
+      for (unsigned i = 0; i < num_loads; ++i) {
+        loads.push_back(__ Load(src_base, OpIndex::Invalid(), load_kind,
+                                mem_rep, result_rep, load_offset));
+        load_offset += bytes_per_load;
+        load_bytes_remaining -= bytes_per_load;
+      }
+    }
+
+    // Copy to the destination.
+    int32_t store_bytes_remaining = bytes_to_copy;
+    int32_t store_offset = 0;
+    unsigned store_index = 0;
+    for (MemoryRepresentation mem_rep : memory_reps) {
+      StoreOp::Kind store_kind = GetMemoryAccessKind(mem_rep, strategy);
+      DCHECK_EQ(store_kind, StoreOp::Kind::RawAligned().NotLoadEliminable());
+      uint8_t bytes_per_store = mem_rep.SizeInBytes();
+      unsigned num_stores = store_bytes_remaining / mem_rep.SizeInBytes();
+      for (unsigned i = 0; i < num_stores; ++i) {
+        __ Store(dst_base, OpIndex::Invalid(), loads[store_index], store_kind,
+                 mem_rep, compiler::kNoWriteBarrier, store_offset);
+        ++store_index;
+        store_offset += bytes_per_store;
+        store_bytes_remaining -= bytes_per_store;
+      }
+    }
+    DCHECK_EQ(load_bytes_remaining, 0);
+    DCHECK_EQ(store_bytes_remaining, 0);
+    DCHECK_EQ(load_offset, store_offset);
+    DCHECK_EQ(store_index, loads.size());
+  }
+
   void MemoryCopy(FullDecoder* decoder, const MemoryCopyImmediate& imm,
                   const Value& dst, const Value& src, const Value& size) {
     const WasmMemory* dst_memory = imm.memory_dst.memory;
     const WasmMemory* src_memory = imm.memory_src.memory;
-    V<WordPtr> dst_uintptr =
+    V<WordPtr> dst_offset =
         MemoryAddressToUintPtrOrOOBTrap(dst_memory->address_type, dst.op);
-    V<WordPtr> src_uintptr =
+    V<WordPtr> src_offset =
         MemoryAddressToUintPtrOrOOBTrap(src_memory->address_type, src.op);
     AddressType min_address_type =
         dst_memory->is_memory64() && src_memory->is_memory64()
             ? AddressType::kI64
             : AddressType::kI32;
-    V<WordPtr> size_uintptr =
+    V<WordPtr> size_op =
         MemoryAddressToUintPtrOrOOBTrap(min_address_type, size.op);
+
+    // If we're copying a small, constant, number of bytes then perform the
+    // copy inline instead of making a call. Only do this when unaligned
+    // accesses are supported and only when we have 64-bit support, otherwise
+    // the register pressure will likely be too high.
+#ifdef V8_TARGET_ARCH_64_BIT
+    if (v8_flags.wasm_memcpy_inlining) {
+      static constexpr uint32_t kMaxInlineBytes = 112;
+      if (SupportedOperations::HasFullUnalignedSupport()) {
+        auto const_size =
+            __ output_graph().Get(size.op).template TryCast<ConstantOp>();
+        if (const_size && const_size->integral() <= kMaxInlineBytes) {
+          InlineMemCopy(dst_memory, src_memory, dst_offset, src_offset, size_op,
+                        static_cast<int32_t>(const_size->integral()));
+          return;
+        }
+      }
+    }
+#endif  // V8_TARGET_ARCH_64_BIT
+
     auto sig = FixedSizeSignature<MachineType>::Returns(MachineType::Int32())
                    .Params(MachineType::Pointer(), MachineType::Uint32(),
                            MachineType::Uint32(), MachineType::UintPtr(),
@@ -4344,8 +4448,8 @@ class TurboshaftGraphBuildingInterface : public WasmGraphBuilderBase {
         CallC(&sig, ExternalReference::wasm_memory_copy(),
               {__ BitcastHeapObjectToWordPtr(trusted_instance_data(false)),
                __ Word32Constant(imm.memory_dst.index),
-               __ Word32Constant(imm.memory_src.index), dst_uintptr,
-               src_uintptr, size_uintptr});
+               __ Word32Constant(imm.memory_src.index), dst_offset, src_offset,
+               size_op});
     __ TrapIfNot(result, TrapId::kTrapMemOutOfBounds);
   }
 
@@ -4605,7 +4709,20 @@ class TurboshaftGraphBuildingInterface : public WasmGraphBuilderBase {
         field.struct_imm.struct_type, field.struct_imm.index,
         field.field_imm.index, is_signed,
         struct_object.type.is_nullable() ? compiler::kWithNullCheck
-                                         : compiler::kWithoutNullCheck);
+                                         : compiler::kWithoutNullCheck,
+        {});
+  }
+
+  void StructAtomicGet(FullDecoder* decoder, const Value& struct_object,
+                       const FieldImmediate& field, bool is_signed,
+                       AtomicMemoryOrder memory_order, Value* result) {
+    result->op = __ StructGet(
+        V<WasmStructNullable>::Cast(struct_object.op),
+        field.struct_imm.struct_type, field.struct_imm.index,
+        field.field_imm.index, is_signed,
+        struct_object.type.is_nullable() ? compiler::kWithNullCheck
+                                         : compiler::kWithoutNullCheck,
+        memory_order);
   }
 
   void StructSet(FullDecoder* decoder, const Value& struct_object,
@@ -4613,9 +4730,117 @@ class TurboshaftGraphBuildingInterface : public WasmGraphBuilderBase {
     __ StructSet(V<WasmStructNullable>::Cast(struct_object.op), field_value.op,
                  field.struct_imm.struct_type, field.struct_imm.index,
                  field.field_imm.index,
-                 struct_object.type.is_nullable()
-                     ? compiler::kWithNullCheck
-                     : compiler::kWithoutNullCheck);
+                 struct_object.type.is_nullable() ? compiler::kWithNullCheck
+                                                  : compiler::kWithoutNullCheck,
+                 {});
+  }
+
+  void StructAtomicSet(FullDecoder* decoder, const Value& struct_object,
+                       const FieldImmediate& field, const Value& field_value,
+                       AtomicMemoryOrder memory_order) {
+    __ StructSet(V<WasmStructNullable>::Cast(struct_object.op), field_value.op,
+                 field.struct_imm.struct_type, field.struct_imm.index,
+                 field.field_imm.index,
+                 struct_object.type.is_nullable() ? compiler::kWithNullCheck
+                                                  : compiler::kWithoutNullCheck,
+                 memory_order);
+  }
+
+  void StructAtomicRMW(FullDecoder* decoder, WasmOpcode opcode,
+                       const Value& struct_object, const FieldImmediate& field,
+                       const Value& field_value, AtomicMemoryOrder memory_order,
+                       Value* result) {
+    if (!field.struct_imm.shared) {
+      // On some architectures atomic operations require aligned accesses while
+      // unshared objects don't have the required alignment. For simplicity we
+      // do the same on all platforms and for all rmw operations (even though
+      // only 64 bit operations should run into alignment problems).
+      // TODO(mliedtke): Reconsider this if atomic operations on unshared
+      // objects remain part of the spec proposal.
+      const StructType* struct_type = field.struct_imm.struct_type;
+      ValueKind field_kind = struct_type->field(field.field_imm.index).kind();
+      V<Any> old_value = __ StructGet(
+          struct_object.op, struct_type, field.struct_imm.index,
+          field.field_imm.index, true,
+          struct_object.type.is_nullable() ? compiler::kWithNullCheck
+                                           : compiler::kWithoutNullCheck,
+          {});
+      result->op = old_value;
+      V<Word> new_value;
+      if (field_kind == ValueKind::kI32) {
+        V<Word32> old = V<Word32>::Cast(old_value);
+        switch (opcode) {
+          case kExprStructAtomicAdd:
+            new_value = __ Word32Add(old, field_value.op);
+            break;
+          case kExprStructAtomicSub:
+            new_value = __ Word32Sub(old, field_value.op);
+            break;
+          case kExprStructAtomicAnd:
+            new_value = __ Word32BitwiseAnd(old, field_value.op);
+            break;
+          case kExprStructAtomicOr:
+            new_value = __ Word32BitwiseOr(old, field_value.op);
+            break;
+          case kExprStructAtomicXor:
+            new_value = __ Word32BitwiseXor(old, field_value.op);
+            break;
+          default:
+            UNREACHABLE();
+        }
+      } else {
+        CHECK_EQ(field_kind, ValueKind::kI64);
+        V<Word64> old = V<Word64>::Cast(old_value);
+        switch (opcode) {
+          case kExprStructAtomicAdd:
+            new_value = __ Word64Add(old, field_value.op);
+            break;
+          case kExprStructAtomicSub:
+            new_value = __ Word64Sub(old, field_value.op);
+            break;
+          case kExprStructAtomicAnd:
+            new_value = __ Word64BitwiseAnd(old, field_value.op);
+            break;
+          case kExprStructAtomicOr:
+            new_value = __ Word64BitwiseOr(old, field_value.op);
+            break;
+          case kExprStructAtomicXor:
+            new_value = __ Word64BitwiseXor(old, field_value.op);
+            break;
+          default:
+            UNREACHABLE();
+        }
+      }
+      DCHECK(new_value.valid());
+      __ StructSet(struct_object.op, new_value, struct_type,
+                   field.struct_imm.index, field.field_imm.index,
+                   compiler::kWithoutNullCheck, {});
+      return;
+    }
+
+    using BinOp = compiler::turboshaft::StructAtomicRMWOp::BinOp;
+    BinOp op = ([](WasmOpcode opcode) -> BinOp {
+      switch (opcode) {
+        case kExprStructAtomicAdd:
+          return BinOp::kAdd;
+        case kExprStructAtomicSub:
+          return BinOp::kSub;
+        case kExprStructAtomicAnd:
+          return BinOp::kAnd;
+        case kExprStructAtomicOr:
+          return BinOp::kOr;
+        case kExprStructAtomicXor:
+          return BinOp::kXor;
+        default:
+          UNIMPLEMENTED();
+      }
+    })(opcode);
+    result->op = __ StructAtomicRMW(
+        struct_object.op, field_value.op, op, field.struct_imm.struct_type,
+        field.struct_imm.index, field.field_imm.index,
+        struct_object.type.is_nullable() ? compiler::kWithNullCheck
+                                         : compiler::kWithoutNullCheck,
+        memory_order);
   }
 
   void ArrayNew(FullDecoder* decoder, const ArrayIndexImmediate& imm,
@@ -4639,7 +4864,17 @@ class TurboshaftGraphBuildingInterface : public WasmGraphBuilderBase {
     auto array_value = V<WasmArrayNullable>::Cast(array_obj.op);
     BoundsCheckArray(array_value, index.op, array_obj.type);
     result->op = __ ArrayGet(array_value, V<Word32>::Cast(index.op),
-                             imm.array_type, is_signed);
+                             imm.array_type, is_signed, {});
+  }
+
+  void ArrayAtomicGet(FullDecoder* decoder, const Value& array_obj,
+                      const ArrayIndexImmediate& imm, const Value& index,
+                      bool is_signed, AtomicMemoryOrder memory_order,
+                      Value* result) {
+    auto array_value = V<WasmArrayNullable>::Cast(array_obj.op);
+    BoundsCheckArray(array_value, index.op, array_obj.type);
+    result->op = __ ArrayGet(array_value, V<Word32>::Cast(index.op),
+                             imm.array_type, is_signed, memory_order);
   }
 
   void ArraySet(FullDecoder* decoder, const Value& array_obj,
@@ -4648,7 +4883,107 @@ class TurboshaftGraphBuildingInterface : public WasmGraphBuilderBase {
     auto array_value = V<WasmArrayNullable>::Cast(array_obj.op);
     BoundsCheckArray(array_value, index.op, array_obj.type);
     __ ArraySet(array_value, V<Word32>::Cast(index.op), V<Any>::Cast(value.op),
-                imm.array_type->element_type());
+                imm.array_type->element_type(), {});
+  }
+
+  void ArrayAtomicSet(FullDecoder* decoder, const Value& array_obj,
+                      const ArrayIndexImmediate& imm, const Value& index,
+                      const Value& value, AtomicMemoryOrder memory_order) {
+    auto array_value = V<WasmArrayNullable>::Cast(array_obj.op);
+    BoundsCheckArray(array_value, index.op, array_obj.type);
+    __ ArraySet(array_value, V<Word32>::Cast(index.op), V<Any>::Cast(value.op),
+                imm.array_type->element_type(), memory_order);
+  }
+
+  void ArrayAtomicRMW(FullDecoder* decoder, WasmOpcode opcode,
+                      const Value& array_obj, const ArrayIndexImmediate& imm,
+                      const Value& index, const Value& value,
+                      AtomicMemoryOrder order, Value* result) {
+    if (!array_obj.type.is_shared()) {
+      // On some architectures atomic operations require aligned accesses while
+      // unshared objects don't have the required alignment. For simplicity we
+      // do the same on all platforms and for all rmw operations (even though
+      // only 64 bit operations should run into alignment problems).
+      // TODO(mliedtke): Reconsider this if atomic operations on unshared
+      // objects remain part of the spec proposal.
+      auto array_value = V<WasmArrayNullable>::Cast(array_obj.op);
+      BoundsCheckArray(array_value, index.op, array_obj.type);
+      V<Any> old_value =
+          __ ArrayGet(array_value, index.op, imm.array_type, true, {});
+      result->op = old_value;
+      V<Word> new_value;
+      ValueType element_type = imm.array_type->element_type();
+      if (element_type == kWasmI32) {
+        V<Word32> old = V<Word32>::Cast(old_value);
+        switch (opcode) {
+          case kExprArrayAtomicAdd:
+            new_value = __ Word32Add(old, value.op);
+            break;
+          case kExprArrayAtomicSub:
+            new_value = __ Word32Sub(old, value.op);
+            break;
+          case kExprArrayAtomicAnd:
+            new_value = __ Word32BitwiseAnd(old, value.op);
+            break;
+          case kExprArrayAtomicOr:
+            new_value = __ Word32BitwiseOr(old, value.op);
+            break;
+          case kExprArrayAtomicXor:
+            new_value = __ Word32BitwiseXor(old, value.op);
+            break;
+          default:
+            UNREACHABLE();
+        }
+      } else {
+        CHECK_EQ(element_type, kWasmI64);
+        V<Word64> old = V<Word64>::Cast(old_value);
+        switch (opcode) {
+          case kExprArrayAtomicAdd:
+            new_value = __ Word64Add(old, value.op);
+            break;
+          case kExprArrayAtomicSub:
+            new_value = __ Word64Sub(old, value.op);
+            break;
+          case kExprArrayAtomicAnd:
+            new_value = __ Word64BitwiseAnd(old, value.op);
+            break;
+          case kExprArrayAtomicOr:
+            new_value = __ Word64BitwiseOr(old, value.op);
+            break;
+          case kExprArrayAtomicXor:
+            new_value = __ Word64BitwiseXor(old, value.op);
+            break;
+          default:
+            UNREACHABLE();
+        }
+      }
+      DCHECK(new_value.valid());
+      __ ArraySet(array_value, index.op, new_value,
+                  imm.array_type->element_type(), {});
+      return;
+    }
+
+    using BinOp = compiler::turboshaft::ArrayAtomicRMWOp::BinOp;
+    BinOp op = ([](WasmOpcode opcode) -> BinOp {
+      switch (opcode) {
+        case kExprArrayAtomicAdd:
+          return BinOp::kAdd;
+        case kExprArrayAtomicSub:
+          return BinOp::kSub;
+        case kExprArrayAtomicAnd:
+          return BinOp::kAnd;
+        case kExprArrayAtomicOr:
+          return BinOp::kOr;
+        case kExprArrayAtomicXor:
+          return BinOp::kXor;
+        default:
+          UNIMPLEMENTED();
+      }
+    })(opcode);
+    auto array_value = V<WasmArrayNullable>::Cast(array_obj.op);
+    BoundsCheckArray(array_value, index.op, array_obj.type);
+    result->op = __ ArrayAtomicRMW(array_value, index.op, value.op, op,
+                                   imm.array_type->element_type(), order);
   }
 
   void ArrayLen(FullDecoder* decoder, const Value& array_obj, Value* result) {
@@ -4725,8 +5060,8 @@ class TurboshaftGraphBuildingInterface : public WasmGraphBuilderBase {
 
           WHILE(__ Word32Constant(1)) {
             V<Any> value = __ ArrayGet(src_array, src_index_loop,
-                                       src_imm.array_type, true);
-            __ ArraySet(dst_array, dst_index_loop, value, element_type);
+                                       src_imm.array_type, true, {});
+            __ ArraySet(dst_array, dst_index_loop, value, element_type, {});
 
             IF_NOT (__ Uint32LessThan(src_index.op, src_index_loop)) BREAK;
 
@@ -4739,8 +5074,8 @@ class TurboshaftGraphBuildingInterface : public WasmGraphBuilderBase {
 
           WHILE(__ Word32Constant(1)) {
             V<Any> value = __ ArrayGet(src_array, src_index_loop,
-                                       src_imm.array_type, true);
-            __ ArraySet(dst_array, dst_index_loop, value, element_type);
+                                       src_imm.array_type, true, {});
+            __ ArraySet(dst_array, dst_index_loop, value, element_type, {});
 
             IF_NOT (__ Uint32LessThan(src_index_loop, src_end_index)) BREAK;
 
@@ -4779,7 +5114,8 @@ class TurboshaftGraphBuildingInterface : public WasmGraphBuilderBase {
     V<WasmArray> array = __ WasmAllocateArray(rtt, element_count, type, shared);
     // Initialize all elements.
     for (int i = 0; i < element_count; i++) {
-      __ ArraySet(array, __ Word32Constant(i), elements[i].op, element_type);
+      __ ArraySet(array, __ Word32Constant(i), elements[i].op, element_type,
+                  {});
     }
     result->op = array;
   }
@@ -4852,7 +5188,7 @@ class TurboshaftGraphBuildingInterface : public WasmGraphBuilderBase {
           1);
     }
     result->op =
-        __ AnnotateWasmType(__ BitcastWordPtrToSmi(result->op), kWasmRefI31);
+        __ AnnotateWasmType(__ BitcastWordPtrToSmi(result->op), result->type);
   }
 
   void I31GetS(FullDecoder* decoder, const Value& input, Value* result) {
@@ -6877,7 +7213,7 @@ class TurboshaftGraphBuildingInterface : public WasmGraphBuilderBase {
         // as a sentinel for the negation of ref.is_null.
         return __ Word32Equal(__ IsNull(arg, input_type), 0);
       case kExprAnyConvertExtern:
-        return __ AnyConvertExtern(arg);
+        return __ AnyConvertExtern(arg, input_type.is_shared());
       case kExprExternConvertAny:
         return __ ExternConvertAny(arg);
       default:
@@ -7488,7 +7824,7 @@ class TurboshaftGraphBuildingInterface : public WasmGraphBuilderBase {
         needs_type_or_null_check &&
         !EquivalentTypes(table->type.AsNonNull(),
                          ValueType::Ref(imm.sig_imm.heap_type()),
-                         decoder->module_, decoder->module_);
+                         decoder->module_);
     bool needs_null_check =
         needs_type_or_null_check && table->type.is_nullable();
 
@@ -8263,7 +8599,7 @@ class TurboshaftGraphBuildingInterface : public WasmGraphBuilderBase {
 
     for (uint32_t i = 0; i < imm.struct_type->field_count(); ++i) {
       __ StructSet(struct_value, args[i], imm.struct_type, imm.index, i,
-                   compiler::kWithoutNullCheck);
+                   compiler::kWithoutNullCheck, {});
     }
     // If this assert fails then initialization of padding field might be
     // necessary.
@@ -8313,7 +8649,7 @@ class TurboshaftGraphBuildingInterface : public WasmGraphBuilderBase {
     ScopedVar<Word32> current_index(this, index);
 
     WHILE(__ Uint32LessThan(current_index, __ Word32Add(index, length))) {
-      __ ArraySet(array, current_index, value, type->element_type());
+      __ ArraySet(array, current_index, value, type->element_type(), {});
       current_index = __ Word32Add(current_index, 1);
     }
 

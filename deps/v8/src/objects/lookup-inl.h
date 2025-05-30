@@ -143,8 +143,7 @@ PropertyKey::PropertyKey(Isolate* isolate, double index) {
   } else {
     index_ = LookupIterator::kInvalidIndex;
     name_ = isolate->factory()->InternalizeString(
-        isolate->factory()->HeapNumberToString(
-            isolate->factory()->NewHeapNumber(index), index));
+        isolate->factory()->DoubleToString(index));
   }
 #else
   index_ = static_cast<size_t>(index);
@@ -343,7 +342,7 @@ void LookupIterator::UpdateProtector(Isolate* isolate,
       *name == roots.iterator_symbol() || *name == roots.species_symbol() ||
       *name == roots.match_all_symbol() || *name == roots.replace_symbol() ||
       *name == roots.split_symbol() || *name == roots.to_primitive_symbol() ||
-      *name == roots.valueOf_string() || *name == roots.length_string();
+      *name == roots.valueOf_string();
   DCHECK_EQ(maybe_protector, debug_maybe_protector);
 #endif  // DEBUG
 
@@ -381,14 +380,16 @@ LookupIterator::Configuration LookupIterator::ComputeConfiguration(
 }
 
 // static
+template <bool is_element>
 MaybeDirectHandle<JSReceiver> LookupIterator::GetRoot(
-    Isolate* isolate, DirectHandle<JSAny> lookup_start_object, size_t index,
-    Configuration configuration) {
+    Isolate* isolate, DirectHandle<JSAny> lookup_start_object,
+    DirectHandle<Name> name, size_t index, Configuration configuration) {
   if (IsJSReceiver(*lookup_start_object, isolate)) {
     return Cast<JSReceiver>(lookup_start_object);
   }
-  return GetRootForNonJSReceiver(
-      isolate, Cast<JSPrimitive>(lookup_start_object), index, configuration);
+  return GetRootForNonJSReceiver<is_element>(
+      isolate, Cast<JSPrimitive>(lookup_start_object), name, index,
+      configuration);
 }
 
 template <class T>

@@ -219,7 +219,7 @@ static void LookupForRead(LookupIterator* it, bool is_has_property) {
         // ICs know how to perform access checks on global proxies.
         if (it->GetHolder<JSObject>().is_identical_to(
                 it->isolate()->global_proxy()) &&
-            !it->isolate()->global_object()->IsDetached()) {
+            !it->isolate()->global_object()->IsDetached(it->isolate())) {
           continue;
         }
         return;
@@ -607,6 +607,29 @@ bool IC::UpdateMegaDOMIC(const MaybeObjectDirectHandle& handler,
   return true;
 }
 
+bool IC::UpdateOneMapManyNamesIC(DirectHandle<Name> new_name) {
+#if V8_ENABLE_WEBASSEMBLY
+  if (state() != MONOMORPHIC) return false;
+  if (!IsKeyedLoadIC() && !IsKeyedStoreIC()) return false;
+  // For JS objects, using the generic stub is faster. Wasm objects benefit
+  // from collecting a map that the optimizing compiler can use.
+  Tagged<Map> old_map = nexus()->GetFirstMap();
+  if (old_map.is_null() || !IsWasmObjectMap(old_map)) return false;
+  if (old_map != *lookup_start_object_map()) return false;
+  Tagged<Name> old_name = nexus()->GetName();
+  if (old_name.is_null()) return false;     // Saw indexed access before.
+  if (old_name == *new_name) return false;  // Something else is wrong.
+  DirectHandle<Smi> generic = IsKeyedLoadIC()
+                                  ? LoadHandler::LoadGeneric(isolate())
+                                  : StoreHandler::StoreGeneric(isolate());
+  ConfigureVectorState(DirectHandle<Name>(), lookup_start_object_map(),
+                       generic);
+  return true;
+#else
+  return false;
+#endif  // V8_ENABLE_WEBASSEMBLY
+}
+
 bool IC::UpdatePolymorphicIC(DirectHandle<Name> name,
                              const MaybeObjectDirectHandle& handler) {
   DCHECK(IsHandler(*handler));
@@ -744,6 +767,7 @@ void IC::SetCache(DirectHandle<Name> name, const MaybeObjectHandle& handler) {
         UpdateMonomorphicIC(handler, name);
         break;
       }
+      if (UpdateOneMapManyNamesIC(name)) break;
       [[fallthrough]];
     case POLYMORPHIC:
       if (UpdatePolymorphicIC(name, handler)) break;
@@ -774,11 +798,8 @@ void LoadIC::UpdateCaches(LookupIterator* lookup) {
       handler = MaybeObjectHandle(LoadHandler::LoadSlow(isolate()));
     } else {
       TRACE_HANDLER_STATS(isolate(), LoadIC_LoadNonexistentDH);
-      Handle<Smi> smi_handler = LoadHandler::LoadNonExistent(isolate());
-      handler = MaybeObjectHandle(LoadHandler::LoadFullChain(
-          isolate(), lookup_start_object_map(),
-          MaybeObjectDirectHandle(isolate()->factory()->null_value()),
-          smi_handler));
+      handler = MaybeObjectHandle(
+          LoadHandler::LoadNonExistent(isolate(), lookup_start_object_map()));
     }
   } else if (IsLoadGlobalIC() && lookup->state() == LookupIterator::JSPROXY) {
     // If there is proxy just install the slow stub since we need to call the
@@ -1292,7 +1313,8 @@ bool AllowReadingHoleElement(ElementsKind elements_kind) {
 
 KeyedAccessLoadMode GetNewKeyedLoadMode(Isolate* isolate,
                                         DirectHandle<HeapObject> receiver,
-                                        size_t index, bool is_found) {
+                                        size_t index, bool is_found,
+                                        MaybeDirectHandle<Object> result) {
   DirectHandle<Map> receiver_map(Cast<HeapObject>(receiver)->map(), isolate);
   if (!AllowConvertHoleElementToUndefined(isolate, receiver_map)) {
     return KeyedAccessLoadMode::kInBounds;
@@ -1307,6 +1329,18 @@ KeyedAccessLoadMode GetNewKeyedLoadMode(Isolate* isolate,
 
   // In bound access and did not read a hole.
   if (is_found) {
+#ifdef V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
+    // We can encode undefined in HOLEY_DOUBLE_ELEMENTS, so we always have to
+    // check for those even if we found a value.
+    if (elements_kind == HOLEY_DOUBLE_ELEMENTS) {
+      DirectHandle<Object> result_handle;
+      if (result.ToHandle(&result_handle)) {
+        if (Is<Undefined>(result_handle)) {
+          always_handle_holes = true;
+        }
+      }
+    }
+#endif  // V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
     return always_handle_holes ? KeyedAccessLoadMode::kHandleHoles
                                : KeyedAccessLoadMode::kInBounds;
   }
@@ -1354,7 +1388,8 @@ KeyedAccessLoadMode GetUpdatedLoadModeForMap(Isolate* isolate,
 }  // namespace
 
 Handle<Object> KeyedLoadIC::LoadElementHandler(
-    DirectHandle<Map> receiver_map, KeyedAccessLoadMode new_load_mode) {
+    DirectHandle<Map> receiver_map, KeyedAccessLoadMode new_load_mode,
+    MaybeDirectHandle<Map> maybe_transition_target) {
   // Has a getter interceptor, or is any has and has a query interceptor.
   if (receiver_map->has_indexed_interceptor() &&
       (receiver_map->GetIndexedInterceptor()->has_getter() ||
@@ -1407,6 +1442,13 @@ Handle<Object> KeyedLoadIC::LoadElementHandler(
       LoadModeHandlesHoles(new_load_mode),
       AllowReadingHoleElement(elements_kind) &&
           AllowConvertHoleElementToUndefined(isolate(), receiver_map));
+  DirectHandle<Map> transition_target;
+  if (is_js_array && maybe_transition_target.ToHandle(&transition_target)) {
+    DCHECK(IsFastElementsKind(elements_kind));
+    return LoadHandler::TransitionAndLoadElement(
+        isolate(), transition_target->elements_kind(), new_load_mode);
+  }
+
   TRACE_HANDLER_STATS(isolate(), KeyedLoadIC_LoadElementDH);
   return LoadHandler::LoadElement(isolate(), elements_kind, is_js_array,
                                   new_load_mode);
@@ -1421,21 +1463,27 @@ void KeyedLoadIC::LoadElementPolymorphicHandlers(
       [](const DirectHandle<Map>& map) { return map->is_deprecated(); }));
 
   for (DirectHandle<Map> receiver_map : *receiver_maps) {
-    // Mark all stable receiver maps that have elements kind transition map
-    // among receiver_maps as unstable because the optimizing compilers may
-    // generate an elements kind transition for this kind of receivers.
-    if (receiver_map->is_stable()) {
       Tagged<Map> tmap = receiver_map->FindElementsKindTransitionedMap(
           isolate(),
           MapHandlesSpan(receiver_maps->begin(), receiver_maps->end()),
           ConcurrencyMode::kSynchronous);
       if (!tmap.is_null()) {
-        receiver_map->NotifyLeafMapLayoutChange(isolate());
+        // Mark all stable receiver maps that have elements kind transition map
+        // among receiver_maps as unstable because the ICs and the optimizing
+        // compilers may perform an elements kind transition for this kind of
+        // receivers.
+        if (receiver_map->is_stable()) {
+          receiver_map->NotifyLeafMapLayoutChange(isolate());
+        }
+        handlers->push_back(MaybeObjectHandle(LoadElementHandler(
+            receiver_map,
+            GetUpdatedLoadModeForMap(isolate(), receiver_map, new_load_mode),
+            handle(tmap, isolate()))));
+      } else {
+        handlers->push_back(MaybeObjectHandle(LoadElementHandler(
+            receiver_map,
+            GetUpdatedLoadModeForMap(isolate(), receiver_map, new_load_mode))));
       }
-    }
-    handlers->push_back(MaybeObjectHandle(LoadElementHandler(
-        receiver_map,
-        GetUpdatedLoadModeForMap(isolate(), receiver_map, new_load_mode))));
   }
 }
 
@@ -1570,7 +1618,7 @@ MaybeDirectHandle<Object> KeyedLoadIC::Load(Handle<JSAny> object,
       IntPtrKeyToSize(maybe_index, Cast<HeapObject>(object), &index)) {
     DirectHandle<HeapObject> receiver = Cast<HeapObject>(object);
     KeyedAccessLoadMode load_mode =
-        GetNewKeyedLoadMode(isolate(), receiver, index, is_found);
+        GetNewKeyedLoadMode(isolate(), receiver, index, is_found, result);
     UpdateLoadElement(receiver, load_mode);
     if (is_vector_set()) {
       TraceIC("LoadIC", key);
@@ -2375,6 +2423,12 @@ Handle<Object> KeyedStoreIC::StoreElementHandler(
       return StoreHandler::StoreProxy(isolate());
     }
 
+#if V8_ENABLE_WEBASSEMBLY
+    if (IsWasmObjectMap(*receiver_map)) {
+      set_slow_stub_reason("wasm object");
+    }
+#endif  // V8_ENABLE_WEBASSEMBLY
+
     // Wasm objects or other kind of special objects go through the slow stub.
     TRACE_HANDLER_STATS(isolate(), KeyedStoreIC_SlowStub);
     return StoreHandler::StoreSlow(isolate(), store_mode);
@@ -2586,12 +2640,6 @@ MaybeDirectHandle<Object> KeyedStoreIC::Store(Handle<JSAny> object,
       set_slow_stub_reason("map in array prototype");
       use_ic = false;
     }
-#if V8_ENABLE_WEBASSEMBLY
-    if (IsWasmObjectMap(heap_object->map())) {
-      set_slow_stub_reason("wasm object");
-      use_ic = false;
-    }
-#endif
   }
 
   Handle<Map> old_receiver_map;

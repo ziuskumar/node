@@ -50,6 +50,8 @@ V8_OBJECT class HeapObjectLayout {
   inline void set_map_safe_transition(IsolateT* isolate, Tagged<Map> value,
                                       ReleaseStoreTag);
 
+  inline ObjectSlot map_slot() const;
+
   inline void set_map_safe_transition_no_write_barrier(
       Isolate* isolate, Tagged<Map> value, RelaxedStoreTag = kRelaxedStore);
 
@@ -140,6 +142,8 @@ template <typename T>
 struct ObjectTraits {
   using BodyDescriptor = typename T::BodyDescriptor;
 };
+
+enum InSharedSpace : bool { kInSharedSpace = true, kNotInSharedSpace = false };
 
 // HeapObject is the superclass for all classes describing heap allocated
 // objects.
@@ -469,7 +473,10 @@ class HeapObject : public TaggedImpl<HeapObjectReferenceType::STRONG, Address> {
   static void VerifyCodePointer(Isolate* isolate, Tagged<Object> p);
 #endif
 
-  static inline AllocationAlignment RequiredAlignment(Tagged<Map> map);
+  static inline AllocationAlignment RequiredAlignment(
+      InSharedSpace in_shared_space, Tagged<Map> map);
+  static inline AllocationAlignment RequiredAlignment(
+      AllocationSpace allocation_space, Tagged<Map> map);
   bool inline CheckRequiredAlignment(PtrComprCageBase cage_base) const;
 
   // Whether the object needs rehashing. That is the case if the object's

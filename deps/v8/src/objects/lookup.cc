@@ -29,8 +29,8 @@ namespace v8::internal {
 template <bool is_element>
 void LookupIterator::Start() {
   // GetRoot might allocate if lookup_start_object_ is a string.
-  MaybeDirectHandle<JSReceiver> maybe_holder =
-      GetRoot(isolate_, lookup_start_object_, index_, configuration_);
+  MaybeDirectHandle<JSReceiver> maybe_holder = GetRoot<is_element>(
+      isolate_, lookup_start_object_, name_, index_, configuration_);
   if (!maybe_holder.ToHandle(&holder_)) {
     // This is an attempt to perform an own property lookup on a non-JSReceiver
     // that doesn't have any properties.
@@ -143,17 +143,20 @@ void LookupIterator::RecheckTypedArrayBounds() {
 }
 
 // static
+template <bool is_element>
 MaybeDirectHandle<JSReceiver> LookupIterator::GetRootForNonJSReceiver(
     Isolate* isolate, DirectHandle<JSPrimitive> lookup_start_object,
-    size_t index, Configuration configuration) {
+    DirectHandle<Name> name, size_t index, Configuration configuration) {
   // Strings are the only non-JSReceiver objects with properties (only elements
   // and 'length') directly on the wrapper. Hence we can skip generating
   // the wrapper for all other cases.
   bool own_property_lookup = (configuration & kPrototypeChain) == 0;
   if (IsString(*lookup_start_object, isolate)) {
     if (own_property_lookup ||
-        index <
-            static_cast<size_t>(Cast<String>(*lookup_start_object)->length())) {
+        (!is_element && *name == ReadOnlyRoots(isolate).length_string()) ||
+        (is_element &&
+         index < static_cast<size_t>(
+                     Cast<String>(*lookup_start_object)->length()))) {
       // TODO(verwaest): Speed this up. Perhaps use a cached wrapper on the
       // native context, ensuring that we don't leak it into JS?
       DirectHandle<JSFunction> constructor = isolate->string_function();
@@ -369,13 +372,6 @@ void LookupIterator::InternalUpdateProtector(
                                      Context::INITIAL_STRING_PROTOTYPE_INDEX) ||
         IsStringWrapper(*receiver)) {
       Protectors::InvalidateStringWrapperToPrimitive(isolate);
-    }
-  } else if (*name == roots.length_string()) {
-    if (!Protectors::IsTypedArrayLengthLookupChainIntact(isolate)) return;
-    if (IsJSTypedArray(*receiver) || IsJSTypedArrayPrototype(*receiver) ||
-        isolate->IsInCreationContext(*receiver,
-                                     Context::TYPED_ARRAY_PROTOTYPE_INDEX)) {
-      Protectors::InvalidateTypedArrayLengthLookupChain(isolate);
     }
   }
 }
@@ -702,9 +698,13 @@ void LookupIterator::ApplyTransitionToDataProperty(
       transition->GetBackPointer(isolate_) == receiver->map(isolate_);
 
   if (configuration_ == DEFAULT && !transition->is_dictionary_map() &&
+      !transition->is_prototype_map() &&
       !transition->IsPrototypeValidityCellValid()) {
     // Only LookupIterator instances with DEFAULT (full prototype chain)
     // configuration can produce valid transition handler maps.
+    // Note that it doesn't make sense to prepare a fast property transition
+    // handler for prototype maps because they are not going to be reused
+    // anyway.
     DirectHandle<UnionOf<Smi, Cell>> validity_cell =
         Map::GetOrCreatePrototypeChainValidityCell(transition, isolate());
     transition->set_prototype_validity_cell(*validity_cell, kRelaxedStore);

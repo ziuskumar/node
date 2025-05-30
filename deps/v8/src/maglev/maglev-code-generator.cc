@@ -620,6 +620,9 @@ class ExceptionHandlerTrampolineBuilder {
       // to Runtime::kThrowFoo?
       DCHECK(!source->allocation().IsRegister());
 
+      // The DeoptInfoVisitor should unwrap identity nodes in frame states.
+      DCHECK(!source->Is<Identity>());
+
       switch (source->properties().value_representation()) {
         case ValueRepresentation::kTagged:
           direct_moves->RecordMove(
@@ -752,6 +755,7 @@ class MaglevCodeGeneratingNodeProcessor {
     size_t ix_deferred = non_deferred_count;
     for (auto block_it = graph->begin(); block_it != graph->end(); ++block_it) {
       BasicBlock* block = *block_it;
+      DCHECK(!block->is_dead());
       if (block->is_deferred()) {
         new_blocks[ix_deferred++] = block;
       } else {
@@ -1843,6 +1847,7 @@ bool MaglevCodeGenerator::EmitDeopts() {
     translation_builder.BuildEagerDeopt(deopt_info);
 
     if (masm_.compilation_info()->collect_source_positions() ||
+        AlwaysPreserveDeoptReason(deopt_info->reason()) ||
         IsDeoptimizationWithoutCodeInvalidation(deopt_info->reason())) {
       // Note: Maglev uses the deopt_reason to tell the deoptimizer not to
       // discard optimized code on deopt during ML-TF OSR. This is why we
@@ -1892,9 +1897,24 @@ bool MaglevCodeGenerator::EmitDeopts() {
 void MaglevCodeGenerator::EmitExceptionHandlerTrampolines() {
   if (code_gen_state_.handlers().empty()) return;
   __ RecordComment("-- Exception handler trampolines");
+
+#ifdef DEBUG
+  // Exception trampolines can allocate HeapNumbers (when a Float64 value is
+  // used as input to a Tagged exception phi).
+  masm()->set_allow_allocate(true);
+#endif
+
   for (NodeBase* node : code_gen_state_.handlers()) {
+    DCHECK(node->properties().can_throw());
+    // Materializations of Phi inputs in the trampoline could allocate
+    // HeapNumbers.
+    DCHECK(node->properties().can_allocate());
     ExceptionHandlerTrampolineBuilder::Build(masm(), node);
   }
+
+#ifdef DEBUG
+  masm()->set_allow_allocate(false);
+#endif
 }
 
 void MaglevCodeGenerator::EmitMetadata() {

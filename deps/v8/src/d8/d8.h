@@ -401,8 +401,7 @@ class ShellOptions {
   // repeated flags for identical boolean values. We allow exceptions for flags
   // with enum-like arguments since their conflicts can also be specified
   // completely.
-  template <class T,
-            bool kAllowIdenticalAssignment = std::is_same<T, bool>::value>
+  template <class T, bool kAllowIdenticalAssignment = std::is_same_v<T, bool>>
   class DisallowReassignment {
    public:
     DisallowReassignment(const char* name, T value)
@@ -555,6 +554,7 @@ class Shell : public i::AllStatic {
   static int Main(int argc, char* argv[]);
   static void Exit(int exit_code);
   static void OnExit(Isolate* isolate, bool dispose);
+  static void DumpCounters();
   static void CollectGarbage(Isolate* isolate);
   static bool EmptyMessageQueues(Isolate* isolate);
   static bool CompleteMessageLoop(Isolate* isolate);
@@ -834,7 +834,6 @@ class Shell : public i::AllStatic {
   static Local<ObjectTemplate> CreateOSTemplate(Isolate* isolate);
   static Local<FunctionTemplate> CreateWorkerTemplate(Isolate* isolate);
   static Local<ObjectTemplate> CreateAsyncHookTemplate(Isolate* isolate);
-  static Local<ObjectTemplate> CreateTestRunnerTemplate(Isolate* isolate);
   static Local<ObjectTemplate> CreatePerformanceTemplate(Isolate* isolate);
   static Local<ObjectTemplate> CreateRealmTemplate(Isolate* isolate);
   static Local<ObjectTemplate> CreateD8Template(Isolate* isolate);

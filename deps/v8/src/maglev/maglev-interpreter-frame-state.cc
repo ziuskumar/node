@@ -382,10 +382,15 @@ MergePointInterpreterFrameState* MergePointInterpreterFrameState::New(
   return merge_state;
 }
 
+void MergePointInterpreterFrameState::set_is_resumable_loop(Graph* graph) {
+  graph->set_may_have_unreachable_blocks();
+  bitfield_ = kIsResumableLoopBit::update(bitfield_, true);
+}
+
 // static
 MergePointInterpreterFrameState* MergePointInterpreterFrameState::NewForLoop(
-    const InterpreterFrameState& start_state, const MaglevCompilationUnit& info,
-    int merge_offset, int predecessor_count,
+    const InterpreterFrameState& start_state, Graph* graph,
+    const MaglevCompilationUnit& info, int merge_offset, int predecessor_count,
     const compiler::BytecodeLivenessState* liveness,
     const compiler::LoopInfo* loop_info, bool has_been_peeled) {
   MergePointInterpreterFrameState* state =
@@ -399,7 +404,7 @@ MergePointInterpreterFrameState* MergePointInterpreterFrameState::NewForLoop(
   if (loop_info->resumable()) {
     state->known_node_aspects_ =
         info.zone()->New<KnownNodeAspects>(info.zone());
-    state->bitfield_ = kIsResumableLoopBit::update(state->bitfield_, true);
+    state->set_is_resumable_loop(graph);
   }
   auto& assignments = loop_info->assignments();
   auto& frame_state = state->frame_state_;
@@ -1097,18 +1102,17 @@ ValueNode* MergePointInterpreterFrameState::MergeValue(
         // `TryMergeLoop`. Some types which are known to cause issues are
         // generalized here.
         NodeType initial_optimistic_type = unmerged_type;
-        if (!IsEmptyNodeType(CombineType(unmerged_type, NodeType::kString))) {
+        if (!IsEmptyNodeType(IntersectType(unmerged_type, NodeType::kString))) {
           // Make sure we don't depend on something being an internalized string
           // in particular, by making the type cover all String subtypes.
-          initial_optimistic_type =
-              IntersectType(unmerged_type, NodeType::kString);
+          initial_optimistic_type = UnionType(unmerged_type, NodeType::kString);
         }
         result->set_type(initial_optimistic_type);
       }
     } else {
       if (optimistic_loop_phis) {
         if (NodeInfo* node_info = known_node_aspects_->TryGetInfoFor(result)) {
-          node_info->IntersectType(unmerged_type);
+          node_info->UnionType(unmerged_type);
         }
         result->merge_type(unmerged_type);
       }
@@ -1219,9 +1223,9 @@ ValueNode* MergePointInterpreterFrameState::MergeValue(
                                  predecessors_[i]);
     }
     result->set_input(i, tagged);
-    type = IntersectType(type, merged_type != NodeType::kUnknown
-                                   ? merged_type
-                                   : AlternativeType(alt));
+    type = UnionType(type, merged_type != NodeType::kUnknown
+                               ? merged_type
+                               : AlternativeType(alt));
     i++;
   }
   DCHECK_EQ(i, predecessors_so_far_);
@@ -1239,7 +1243,7 @@ ValueNode* MergePointInterpreterFrameState::MergeValue(
     DCHECK(result->is_unmerged_loop_phi());
     UpdateLoopPhiType(result, type);
   } else {
-    result->set_type(IntersectType(type, unmerged_type));
+    result->set_type(UnionType(type, unmerged_type));
   }
 
   phis_.Add(result);
@@ -1323,7 +1327,7 @@ MergePointInterpreterFrameState::MergeVirtualObjectValue(
     result->set_input(i, unmerged);
   }
 
-  result->set_type(IntersectType(merged_type, unmerged_type));
+  result->set_type(UnionType(merged_type, unmerged_type));
 
   phis_.Add(result);
   return result;
@@ -1405,6 +1409,12 @@ bool MergePointInterpreterFrameState::IsUnreachableByForwardEdge() const {
     default:
       return false;
   }
+}
+
+bool MergePointInterpreterFrameState::IsUnreachable() const {
+  if (is_exception_handler()) return false;
+  if (is_resumable_loop()) return false;
+  return IsUnreachableByForwardEdge();
 }
 
 void MergePointInterpreterFrameState::RemovePredecessorAt(int predecessor_id) {

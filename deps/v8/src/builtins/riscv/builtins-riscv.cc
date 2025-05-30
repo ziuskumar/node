@@ -1099,15 +1099,18 @@ void Builtins::Generate_BaselineOutOfLinePrologue(MacroAssembler* masm) {
     FrameScope frame_scope(masm, StackFrame::INTERNAL);
     // Save incoming new target or generator
     __ Push(kJavaScriptCallNewTargetRegister);
-#if defined(V8_ENABLE_LEAPTIERING) && defined(V8_TARGET_ARCH_RISCV64)
+#if defined(V8_JS_LINKAGE_INCLUDES_DISPATCH_HANDLE) && \
+    defined(V8_TARGET_ARCH_RISCV64)
     // No need to SmiTag as dispatch handles always look like Smis.
     static_assert(kJSDispatchHandleShift > 0);
+    __ AssertSmi(kJavaScriptCallDispatchHandleRegister);
     __ Push(kJavaScriptCallDispatchHandleRegister);
 #endif
     __ SmiTag(frame_size);
     __ Push(frame_size);
     __ CallRuntime(Runtime::kStackGuardWithGap);
-#if defined(V8_ENABLE_LEAPTIERING) && defined(V8_TARGET_ARCH_RISCV64)
+#if defined(V8_JS_LINKAGE_INCLUDES_DISPATCH_HANDLE) && \
+    defined(V8_TARGET_ARCH_RISCV64)
     __ Pop(kJavaScriptCallDispatchHandleRegister);
 #endif
     __ Pop(kJavaScriptCallNewTargetRegister);
@@ -4990,6 +4993,54 @@ void Builtins::Generate_DeoptimizationEntry_Eager(MacroAssembler* masm) {
 
 void Builtins::Generate_DeoptimizationEntry_Lazy(MacroAssembler* masm) {
   Generate_DeoptimizationEntry(masm, DeoptimizeKind::kLazy);
+}
+
+void Builtins::Generate_DeoptimizationEntry_LazyAfterFastCall(
+    MacroAssembler* masm) {
+  auto regs = RegisterAllocator::WithAllocatableGeneralRegisters();
+  // The deoptimizer may have been triggered right after the return of a fast
+  // API call. In that case, exception handling and possible stack unwinding
+  // did not happen yet.
+  // We check here if a there is a pending exception by comparing the
+  // exception stored in the isolate with the no-exception sentinel
+  // (the_hole_value). If there is an exception, we call PropagateException to
+  // trigger stack unwinding.
+  Label no_exception;
+  DEFINE_REG(scratch);
+  __ LoadWord(scratch,
+              __ ExternalReferenceAsOperand(
+                  ExternalReference::Create(IsolateAddressId::kExceptionAddress,
+                                            __ isolate()),
+                  scratch));
+  DEFINE_REG(hole_value);
+  __ LoadRoot(hole_value, RootIndex::kTheHoleValue);
+  __ CompareTaggedAndBranch(&no_exception, eq, scratch, Operand(hole_value));
+
+  __ EnterFrame(StackFrame::INTERNAL);
+  const RegList kCalleeSaveRegisters = kCalleeSaved;
+  const DoubleRegList kCalleeSaveFPRegisters = kCalleeSavedFPU;
+  // DeoptimizeEntry_Lazy uses the `lr` register to determine where the deopt
+  // came from. The runtime call below overwrites the `lr` register. We have to
+  // spill it on the stack here to preserve it.
+  __ PushAll(kCalleeSaveFPRegisters);
+  __ PushAll(kCalleeSaveRegisters);
+  __ li(kContextRegister, Operand(Context::kNoContext));
+  // We have to reset IsolateData::fast_c_call_caller_fp(), because otherwise
+  // the  stack unwinder thinks that we are still within the fast C call.
+  if (v8_flags.debug_code) {
+    __ LoadWord(scratch, __ ExternalReferenceAsOperand(
+                             IsolateFieldId::kFastCCallCallerFP));
+    __ Assert(ne, AbortReason::kFastCallFallbackInvalid, scratch,
+              Operand(zero_reg));
+  }
+  __ StoreWord(zero_reg, __ ExternalReferenceAsOperand(
+                             IsolateFieldId::kFastCCallCallerFP));
+  __ CallRuntime(Runtime::FunctionId::kPropagateException);
+  __ PopAll(kCalleeSaveRegisters);
+  __ PopAll(kCalleeSaveFPRegisters);
+  __ LeaveFrame(StackFrame::INTERNAL);
+  __ bind(&no_exception);
+  __ TailCallBuiltin(Builtin::kDeoptimizationEntry_Lazy);
 }
 
 // If there is baseline code on the shared function info, converts an

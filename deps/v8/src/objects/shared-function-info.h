@@ -359,9 +359,9 @@ class SharedFunctionInfo
   template <typename T, IndirectPointerTag tag>
   inline Tagged<T> GetTrustedData(IsolateForSandbox isolate) const;
 
-  // Helper function when no Isolate is available. Prefer to use the variant
-  // with an isolate parameter if possible.
-  inline Tagged<Object> GetTrustedData() const;
+  // Some code may encounter unreachable unusable objects and needs to skip
+  // over them without crashing.
+  inline bool HasUnpublishedTrustedData(IsolateForSandbox isolate) const;
 
  private:
   // For the sandbox, the function's data is split across two fields, with the
@@ -421,10 +421,10 @@ class SharedFunctionInfo
 
 #if V8_ENABLE_WEBASSEMBLY
   inline bool HasAsmWasmData() const;
-  inline bool HasWasmFunctionData() const;
-  inline bool HasWasmExportedFunctionData() const;
-  inline bool HasWasmJSFunctionData() const;
-  inline bool HasWasmCapiFunctionData() const;
+  inline bool HasWasmFunctionData(IsolateForSandbox) const;
+  inline bool HasWasmExportedFunctionData(IsolateForSandbox) const;
+  inline bool HasWasmJSFunctionData(IsolateForSandbox) const;
+  inline bool HasWasmCapiFunctionData(IsolateForSandbox) const;
   inline bool HasWasmResumeData() const;
   DECL_ACCESSORS(asm_wasm_data, Tagged<AsmWasmData>)
 
@@ -443,18 +443,20 @@ class SharedFunctionInfo
   inline bool HasBuiltinId() const;
   DECL_PRIMITIVE_ACCESSORS(builtin_id, Builtin)
 
-  inline bool HasUncompiledData() const;
+  inline bool HasUncompiledData(IsolateForSandbox isolate) const;
   inline Tagged<UncompiledData> uncompiled_data(
       IsolateForSandbox isolate) const;
   inline void set_uncompiled_data(Tagged<UncompiledData> data,
                                   WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
-  inline bool HasUncompiledDataWithPreparseData() const;
+  inline bool HasUncompiledDataWithPreparseData(
+      IsolateForSandbox isolate) const;
   inline Tagged<UncompiledDataWithPreparseData>
   uncompiled_data_with_preparse_data(IsolateForSandbox isolate) const;
   inline void set_uncompiled_data_with_preparse_data(
       Tagged<UncompiledDataWithPreparseData> data,
       WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
-  inline bool HasUncompiledDataWithoutPreparseData() const;
+  inline bool HasUncompiledDataWithoutPreparseData(
+      IsolateForSandbox isolate) const;
   inline void ClearUncompiledDataJobPointer(IsolateForSandbox isolate);
 
   // Clear out pre-parsed scope data from UncompiledDataWithPreparseData,
@@ -521,6 +523,7 @@ class SharedFunctionInfo
 
   // [flags] Bit field containing various flags about the function.
   DECL_RELAXED_INT32_ACCESSORS(flags)
+  DECL_RELAXED_INT32_ACCESSORS(function_literal_id)
   DECL_UINT8_ACCESSORS(flags2)
 
   DECL_UINT16_ACCESSORS(age)
@@ -605,7 +608,8 @@ class SharedFunctionInfo
   // Indicates whether optimizations have been disabled for this shared function
   // info. If we cannot optimize the function we disable optimization to avoid
   // spending time attempting to optimize it again.
-  inline bool optimization_disabled() const;
+  inline bool optimization_disabled(CodeKind kind) const;
+  inline bool all_optimization_disabled() const;
 
   // The reason why optimization was disabled.
   inline BailoutReason disabled_optimization_reason() const;
@@ -676,7 +680,7 @@ class SharedFunctionInfo
   };
   // Returns the first value that applies (see enum definition for the order).
   template <typename IsolateT>
-  Inlineability GetInlineability(IsolateT* isolate) const;
+  Inlineability GetInlineability(CodeKind code_kind, IsolateT* isolate) const;
 
   // Source size of this function.
   int SourceSize();
@@ -886,6 +890,22 @@ class V8_NODISCARD IsCompiledScope {
 
  private:
   MaybeHandle<HeapObject> retain_code_ = {};
+  bool is_compiled_ = false;
+};
+
+// IsBaselineCompiledScope enables a caller to check if a function is baseline
+// compiled, and ensure it remains compiled (i.e., doesn't have it's baseline
+// code flushed) while the scope is retained.
+class V8_NODISCARD IsBaselineCompiledScope {
+ public:
+  inline IsBaselineCompiledScope(const Tagged<SharedFunctionInfo> shared,
+                                 Isolate* isolate);
+  inline IsBaselineCompiledScope() = default;
+
+  inline bool is_compiled() const { return is_compiled_; }
+
+ private:
+  MaybeHandle<Code> retain_code_ = {};
   bool is_compiled_ = false;
 };
 

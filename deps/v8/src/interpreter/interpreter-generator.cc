@@ -964,7 +964,7 @@ class InterpreterBinaryOpAssembler : public InterpreterAssembler {
       TNode<UintPtrT> slot, const LazyNode<HeapObject>& maybe_feedback_vector,
       UpdateFeedbackMode update_feedback_mode, bool rhs_known_smi);
 
-  void BinaryOpWithFeedback(BinaryOpGenerator generator) {
+  void BinaryOpWithFeedback_WithoutDispatch(BinaryOpGenerator generator) {
     TNode<Object> lhs = LoadRegisterAtOperandIndex(0);
     TNode<Object> rhs = GetAccumulator();
     TNode<Context> context = GetContext();
@@ -978,6 +978,10 @@ class InterpreterBinaryOpAssembler : public InterpreterAssembler {
         [=] { return context; }, lhs, rhs, slot_index,
         [=] { return maybe_feedback_vector; }, mode, false);
     SetAccumulator(result);
+  }
+
+  void BinaryOpWithFeedback(BinaryOpGenerator generator) {
+    BinaryOpWithFeedback_WithoutDispatch(generator);
     Dispatch();
   }
 
@@ -1006,14 +1010,40 @@ IGNITION_HANDLER(Add, InterpreterBinaryOpAssembler) {
   BinaryOpWithFeedback(&BinaryOpAssembler::Generate_AddWithFeedback);
 }
 
-// Add_LhsIsConstant_Internalize <src>
+// Add_StringConstant_Internalize <src>
 //
 // Add register <src> to accumulator.
-IGNITION_HANDLER(Add_LhsIsStringConstant_Internalize,
-                 InterpreterBinaryOpAssembler) {
-  BinaryOpWithFeedback(
+IGNITION_HANDLER(Add_StringConstant_Internalize, InterpreterBinaryOpAssembler) {
+  auto as_variant = UncheckedCast<Int32T>(BytecodeOperandFlag8(2));
+  using ASVariant = AddStringConstantAndInternalizeVariant;
+  auto lhs_is_sc =
+      Int32Constant(static_cast<uint8_t>(ASVariant::kLhsIsStringConstant));
+
+  Label if_lhs_is_string_constant(this), if_rhs_is_string_constant(this),
+      done(this);
+  Branch(Word32Equal(as_variant, lhs_is_sc), &if_lhs_is_string_constant,
+         &if_rhs_is_string_constant);
+
+  BIND(&if_lhs_is_string_constant);
+  CSA_DCHECK(this, Word32Equal(as_variant, lhs_is_sc));
+  BinaryOpWithFeedback_WithoutDispatch(
       &BinaryOpAssembler::
           Generate_AddLhsIsStringConstantInternalizeWithFeedback);
+  Goto(&done);
+
+  BIND(&if_rhs_is_string_constant);
+#ifdef DEBUG
+  auto rhs_is_sc =
+      Int32Constant(static_cast<uint8_t>(ASVariant::kRhsIsStringConstant));
+  CSA_DCHECK(this, Word32Equal(as_variant, rhs_is_sc));
+#endif  // DEBUG
+  BinaryOpWithFeedback_WithoutDispatch(
+      &BinaryOpAssembler::
+          Generate_AddRhsIsStringConstantInternalizeWithFeedback);
+  Goto(&done);
+
+  BIND(&done);
+  Dispatch();
 }
 
 // Sub <src>
@@ -2814,7 +2844,23 @@ IGNITION_HANDLER(CreateFunctionContext, InterpreterAssembler) {
   TNode<Context> context = GetContext();
   ConstructorBuiltinsAssembler constructor_assembler(state());
   SetAccumulator(constructor_assembler.FastNewFunctionContext(
-      scope_info, slots, context, FUNCTION_SCOPE));
+      scope_info, slots, context, FUNCTION_SCOPE,
+      ContextMode::kNoContextCells));
+  Dispatch();
+}
+
+// CreateFunctionContext <scope_info_idx> <slots>
+//
+// Creates a new context with number of |slots| for the function closure.
+IGNITION_HANDLER(CreateFunctionContextWithCells, InterpreterAssembler) {
+  TNode<UintPtrT> scope_info_idx = BytecodeOperandIdx(0);
+  TNode<ScopeInfo> scope_info = CAST(LoadConstantPoolEntry(scope_info_idx));
+  TNode<Uint32T> slots = BytecodeOperandUImm(1);
+  TNode<Context> context = GetContext();
+  ConstructorBuiltinsAssembler constructor_assembler(state());
+  SetAccumulator(constructor_assembler.FastNewFunctionContext(
+      scope_info, slots, context, FUNCTION_SCOPE,
+      ContextMode::kHasContextCells));
   Dispatch();
 }
 
@@ -2828,7 +2874,7 @@ IGNITION_HANDLER(CreateEvalContext, InterpreterAssembler) {
   TNode<Context> context = GetContext();
   ConstructorBuiltinsAssembler constructor_assembler(state());
   SetAccumulator(constructor_assembler.FastNewFunctionContext(
-      scope_info, slots, context, EVAL_SCOPE));
+      scope_info, slots, context, EVAL_SCOPE, ContextMode::kNoContextCells));
   Dispatch();
 }
 
